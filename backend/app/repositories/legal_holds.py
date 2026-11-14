@@ -81,5 +81,37 @@ def count_active(conn: sqlite3.Connection) -> int:
 
 
 def match_holds(holds: list[dict[str, Any]], row: dict[str, Any]) -> dict[str, Any] | None:
-    """返回第一条命中的启用冻结登记；语义与 trg_ledger_block_frozen_delete 保持一致。"""
+    """返回第一条命中的启用冻结登记；语义与 trg_ledger_block_frozen_delete 保持一致。
+
+    命中条件（与触发器 WHEN 子句一一对应）：
+    - 冻结处于启用（active=1）；
+    - hold.stream_id 为空（不限流）或等于该行 stream_id；
+    - scope='entity_key' 且 entity_key 相同；
+      或 scope='time_range' 且 event_ts 落在 [start_ts, end_ts]（端点可空=不限）。
+    """
+    stream_id = row.get("stream_id")
+    entity_key = row.get("entity_key")
+    event_ts = row.get("event_ts")
+    for hold in holds:
+        if not int(hold.get("active") or 0):
+            continue
+        hold_stream = hold.get("stream_id")
+        if hold_stream is not None:
+            if stream_id is None or int(hold_stream) != int(stream_id):
+                continue
+        scope = hold.get("scope")
+        if scope == "entity_key":
+            hold_key = hold.get("entity_key")
+            if hold_key is not None and hold_key == entity_key:
+                return hold
+        elif scope == "time_range":
+            if event_ts is None:
+                continue
+            start_ts = hold.get("start_ts")
+            end_ts = hold.get("end_ts")
+            if start_ts is not None and event_ts < start_ts:
+                continue
+            if end_ts is not None and event_ts > end_ts:
+                continue
+            return hold
     return None

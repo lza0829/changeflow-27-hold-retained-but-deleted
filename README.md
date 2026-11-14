@@ -52,6 +52,13 @@ cd frontend && npm install && npm run dev
 - **两段式清理**：① 预览（扫描超窗生成清单，不删）→ ② 执行（只按预览可删清单删除）。
   预览时已冻结的行不会在后续执行中变成可删；冻结解除后需重新预览。
   执行前会复核冻结/隔离，比对冻结**只收缩不扩张**。
+- **保全护栏证明**：预览/执行批次的报告都带 `guardrail` 块——`frozen_hit_keys`（冻结命中键，
+  以 ledger_id 标识）、`retained_count`（因冻结保留条数）、`deleted_count`、
+  `preview_vs_execute_frozen_delta`（执行冻结集相对预览的新增/缺失）。
+  执行前若预览承诺「因冻结保留」的键已不在账本残留集（与预览冻结集不一致），
+  整批**拒绝执行**（状态 `rejected`，一行不删）并在 `note`/`guardrail.refusal_reasons` 写明原因；
+  执行后逐项校验报保留的冻结键仍在账本残留集。Cleanup 页批次详情展示该护栏块，
+  与冻结名单、账本残留、批报告同源。
 - **冲突与排除**：冻结优先于删除；仍在隔离区（`quarantine` 中同 `stream_id, seq`）的账本行被视为
   游标停点证据，一律排除并注明原因。执行前新增的冻结/隔离同样保留并计入对账。
 
@@ -68,6 +75,8 @@ cd frontend && npm install && npm run dev
 - `frozen_retained = preview_frozen − frozen_missing + newly_frozen`
 - `cursor_protected = preview_protected − protected_missing + newly_protected`
 - 预览清单总条数 = 各执行态计数之和；删除只能来自预览可删清单
+- 报「因冻结保留」的冻结键执行后全部仍在账本残留集（`frozen_rows_present_after_execute`）
+- 执行冻结集覆盖预览冻结集，removed = 0（`frozen_set_consistent_with_preview`）
 
 全部通过时 `report.reconciled = true`。冻结名单与清理批次持久化在 SQLite，刷新/重启后仍在。
 

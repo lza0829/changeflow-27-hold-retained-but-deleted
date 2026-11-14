@@ -49,6 +49,40 @@ def _quarantine_keys(conn: sqlite3.Connection) -> set[tuple[int, int]]:
     return {(int(r["stream_id"]), int(r["seq"])) for r in rows}
 
 
+# ---------------------------------------------------------------- guardrail proof
+
+
+def _frozen_key_entry(
+    *,
+    ledger_id: int,
+    stream_id: int,
+    seq: int,
+    entity_key: str,
+    hold_id: int | None,
+) -> dict[str, Any]:
+    """一条冻结命中键：以 ledger_id 为同一批次内预览↔执行比对的不变标识。"""
+    return {
+        "key": f"ledger#{int(ledger_id)}",
+        "ledger_id": int(ledger_id),
+        "stream_id": int(stream_id),
+        "seq": int(seq),
+        "entity_key": entity_key,
+        "hold_id": int(hold_id) if hold_id is not None else None,
+    }
+
+
+def _frozen_delta(
+    preview_entries: list[dict[str, Any]], execute_entries: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """预览冻结集 vs 执行冻结集：added 只允许新增命中（收缩删除范围），removed 必须为空。"""
+    preview_ids = {e["ledger_id"] for e in preview_entries}
+    execute_ids = {e["ledger_id"] for e in execute_entries}
+    return {
+        "added": [e for e in execute_entries if e["ledger_id"] not in preview_ids],
+        "removed": [e for e in preview_entries if e["ledger_id"] not in execute_ids],
+    }
+
+
 def _classify(
     row: dict[str, Any],
     *,
@@ -143,6 +177,17 @@ def create_preview(
         )
 
     ledger_count = len(rows)
+    frozen_entries = [
+        _frozen_key_entry(
+            ledger_id=i["ledger_id"],
+            stream_id=i["stream_id"],
+            seq=i["seq"],
+            entity_key=i["entity_key"],
+            hold_id=i["hold_id"],
+        )
+        for i in items
+        if i["decision"] == "frozen_retained"
+    ]
     report = {
         "retention_days": days,
         "cutoff_ts": cutoff_ts,
@@ -153,6 +198,17 @@ def create_preview(
         "cursor_protected_count": counts["cursor_protected"],
         "active_hold_count": len(holds),
         "holds": hold_snapshot,
+        "guardrail": {
+            # 保全护栏证明（预览态）：冻结命中键即「因冻结保留」承诺集，
+            # 执行时必须全部仍在账本残留集，否则拒绝执行。
+            "frozen_hit_keys": frozen_entries,
+            "retained_count": counts["frozen_retained"],
+            "deleted_count": 0,
+            "planned_delete_count": counts["delete"],
+            "preview_vs_execute_frozen_delta": None,
+            "refused": False,
+            "refusal_reasons": [],
+        },
         "policy": {
             "target": "change_ledger",
             "quarantine_targeted": False,
@@ -161,7 +217,11 @@ def create_preview(
                 "按 (stream_id, seq) 仍存在于 quarantine 的账本行一律排除，"
                 "需先经 replay/裁决处置隔离记录后再随保留窗清理。"
             ),
-            "freeze_precedence": "冻结优先于删除；执行前复核启用中的冻结，新命中一律保留。",
+            "freeze_precedence": (
+                "冻结优先于删除；执行前复核启用中的冻结，新命中一律保留（只收缩不扩张）。"
+                "预览承诺「因冻结保留」的键在执行时必须仍在账本残留集，"
+                "任一缺失即与预览冻结集不一致，整批拒绝执行并写明原因。"
+            ),
         },
     }
 
@@ -271,11 +331,61 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
 
     items = conn.execute(
         """
-        SELECT id, ledger_id, stream_id, seq, entity_key, event_ts, decision
+        SELECT id, ledger_id, stream_id, seq, entity_key, event_ts, decision, hold_id
         FROM ledger_cleanup_items WHERE batch_id=? ORDER BY id
         """,
         (batch_id,),
     ).fetchall()
+
+    preview_frozen_entries = [
+        _frozen_key_entry(
+            ledger_id=i["ledger_id"],
+            stream_id=i["stream_id"],
+            seq=i["seq"],
+            entity_key=i["entity_key"],
+            hold_id=i["hold_id"],
+        )
+        for i in items
+        if i["decision"] == "frozen_retained"
+    ]
+
+    # 保全护栏：预览承诺「因冻结保留」的键，执行时必须全部仍在账本残留集。
+    # 任一冻结键消失（如被其它批次/绕过护栏的路径删除）即与预览冻结集不一致，
+    # 拒绝整批执行并写明原因，杜绝「报保留实删除」。
+    missing_frozen = [
+        e for e in preview_frozen_entries if e["ledger_id"] not in existing_ids
+    ]
+    if missing_frozen:
+        missing_text = "、".join(
+            f"ledger#{e['ledger_id']}({e['entity_key']})" for e in missing_frozen
+        )
+        reason = (
+            f"执行前冻结集与预览不一致：预览标记「因冻结保留」的 {missing_text} "
+            "已不在账本残留集。报保留的行不得消失，本批次拒绝执行且未删除任何行；"
+            "请重新预览生成新批次。"
+        )
+        report = json.loads(batch["report_json"] or "{}")
+        report["guardrail"] = {
+            "frozen_hit_keys": preview_frozen_entries,
+            "retained_count": 0,
+            "deleted_count": 0,
+            "preview_vs_execute_frozen_delta": {
+                "added": [],
+                "removed": missing_frozen,
+            },
+            "refused": True,
+            "refusal_reasons": [reason],
+        }
+        report["reconciled"] = False
+        conn.execute(
+            """
+            UPDATE ledger_cleanup_batches SET status='rejected', note=?, report_json=?
+            WHERE id=?
+            """,
+            (reason, json.dumps(report, ensure_ascii=False), batch_id),
+        )
+        conn.commit()
+        raise ValueError(reason)
 
     counters = {
         "deleted": 0,
@@ -287,6 +397,7 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "preview_frozen_missing": 0,
         "preview_protected_missing": 0,
     }
+    retained_frozen: list[dict[str, Any]] = []
 
     for raw in items:
         item = dict(raw)
@@ -311,12 +422,20 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
             # 预览时已冻结：本批次不扩大删除范围，保持保留。若冻结已解除，
             # 需要重新预览后再删，避免单批次内决策漂移。
             counters["frozen_retained"] += 1
-            cur = conn.execute("DELETE FROM change_ledger WHERE id=?", (ledger_id,))
+            retained_frozen.append(
+                _frozen_key_entry(
+                    ledger_id=ledger_id,
+                    stream_id=item["stream_id"],
+                    seq=item["seq"],
+                    entity_key=item["entity_key"],
+                    hold_id=(hold or {}).get("id") or item["hold_id"],
+                )
+            )
             _set_item_state(
                 conn,
                 item["id"],
                 "frozen_retained",
-                deleted=cur.rowcount == 1,
+                deleted=False,
                 hold_id=(hold or {}).get("id"),
             )
             continue
@@ -330,6 +449,15 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         if hold is not None:
             counters["newly_frozen"] += 1
             counters["frozen_retained"] += 1
+            retained_frozen.append(
+                _frozen_key_entry(
+                    ledger_id=ledger_id,
+                    stream_id=item["stream_id"],
+                    seq=item["seq"],
+                    entity_key=item["entity_key"],
+                    hold_id=hold["id"],
+                )
+            )
             _set_item_state(
                 conn, item["id"], "frozen_retained", deleted=False, hold_id=hold["id"]
             )
@@ -356,6 +484,15 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
                     "event_ts": event_ts,
                 },
             )
+            retained_frozen.append(
+                _frozen_key_entry(
+                    ledger_id=ledger_id,
+                    stream_id=item["stream_id"],
+                    seq=item["seq"],
+                    entity_key=item["entity_key"],
+                    hold_id=(fresh or {}).get("id"),
+                )
+            )
             _set_item_state(
                 conn,
                 item["id"],
@@ -374,6 +511,22 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
     ledger_after = int(
         conn.execute("SELECT COUNT(*) c FROM change_ledger").fetchone()["c"]
     )
+
+    # 护栏证明：报「因冻结保留」的键，执行后必须全部仍在账本残留集。
+    retained_ids = [e["ledger_id"] for e in retained_frozen]
+    frozen_missing_after: list[int] = []
+    if retained_ids:
+        marks = ",".join("?" for _ in retained_ids)
+        present = {
+            int(r["id"])
+            for r in conn.execute(
+                f"SELECT id FROM change_ledger WHERE id IN ({marks})", retained_ids
+            ).fetchall()
+        }
+        frozen_missing_after = [i for i in retained_ids if i not in present]
+
+    frozen_delta = _frozen_delta(preview_frozen_entries, retained_frozen)
+
     active_hold_count = holds_repo.count_active(conn)
     report = json.loads(batch["report_json"] or "{}")
     report.update(
@@ -391,6 +544,17 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
             "quarantine_linked_count": len(quarantined_now),
         }
     )
+    report["guardrail"] = {
+        # 保全护栏证明（执行态）：frozen_hit_keys 即本次实际保留的冻结键，
+        # 与冻结名单、账本残留、批报告同源（同一事务内的 change_ledger /
+        # legal_holds / ledger_cleanup_items）。
+        "frozen_hit_keys": retained_frozen,
+        "retained_count": counters["frozen_retained"],
+        "deleted_count": counters["deleted"],
+        "preview_vs_execute_frozen_delta": frozen_delta,
+        "refused": False,
+        "refusal_reasons": [],
+    }
     checks = _execute_checks(
         preview_deletable=int(batch["deletable_count"]),
         preview_frozen=int(batch["frozen_retained_count"]),
@@ -398,6 +562,29 @@ def execute_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         ledger_before=ledger_before,
         ledger_after=ledger_after,
         counters=counters,
+    )
+    checks.append(
+        {
+            "name": "frozen_rows_present_after_execute",
+            "ok": not frozen_missing_after,
+            "detail": (
+                f"报保留的 {len(retained_ids)} 条冻结键执行后全部仍在账本残留集"
+                if not frozen_missing_after
+                else f"报保留的冻结键执行后缺失 ledger_id={frozen_missing_after}"
+            ),
+        }
+    )
+    checks.append(
+        {
+            "name": "frozen_set_consistent_with_preview",
+            "ok": not frozen_delta["removed"],
+            "detail": (
+                "执行冻结集覆盖预览冻结集（只收缩不扩张，removed=0）"
+                if not frozen_delta["removed"]
+                else "预览冻结键在执行结果中缺失 ledger_id="
+                + str([e["ledger_id"] for e in frozen_delta["removed"]])
+            ),
+        }
     )
     report["checks"] = checks
     report["reconciled"] = all(c["ok"] for c in checks)

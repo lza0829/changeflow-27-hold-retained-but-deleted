@@ -39,6 +39,11 @@ const checks = computed(() => batch.value?.report?.checks || [])
 const reconciled = computed(() =>
   checks.value.length ? checks.value.every((c) => c.ok) : null,
 )
+// 保全护栏证明：与冻结名单、账本残留、批报告同源（均来自批次详情接口）。
+const guardrail = computed(() => batch.value?.report?.guardrail || null)
+const guardrailDelta = computed(
+  () => guardrail.value?.preview_vs_execute_frozen_delta || null,
+)
 const deleteItems = computed(() =>
   (batch.value?.items || []).filter((i) => i.decision === 'delete'),
 )
@@ -135,16 +140,21 @@ async function runExecute() {
   if (!batch.value) return
   if (!confirm(`正式删除批次 #${batch.value.id} 的 ${batch.value.deletable_count} 条超窗账本行？冻结中的记录会被保留。`)) return
   busy.value = true
+  const batchId = batch.value.id
   try {
     batch.value = await postJSON(
-      `/api/ledger/cleanup/batches/${batch.value.id}/execute`,
+      `/api/ledger/cleanup/batches/${batchId}/execute`,
       {},
     )
-    await load()
   } catch (e) {
+    // 执行被护栏拒绝时，回拉批次详情展示拒绝原因与护栏块。
     err.value = String(e.message || e)
+    try {
+      batch.value = await getJSON(`/api/ledger/cleanup/batches/${batchId}`)
+    } catch { /* 保留原批次视图 */ }
   } finally {
     busy.value = false
+    await load()
   }
 }
 
@@ -258,7 +268,9 @@ onMounted(load)
           保留窗 {{ batch.retention_days }} 天 · 截止点 {{ batch.cutoff_ts }} ·
           生成于 {{ batch.created_at }}
           <span v-if="batch.executed_at"> · 执行于 {{ batch.executed_at }}</span>
+          <span v-if="batch.status === 'rejected'" class="tag danger">已被护栏拒绝</span>
         </p>
+        <p v-if="batch.note" class="tag danger">{{ batch.note }}</p>
         <table>
           <thead>
             <tr><th>指标</th><th>值</th><th>说明</th></tr>
@@ -298,6 +310,72 @@ onMounted(load)
             </tr>
           </tbody>
         </table>
+
+        <template v-if="guardrail">
+          <h3>保全护栏证明</h3>
+          <p class="muted">
+            与冻结名单、账本残留、批报告同源。预览承诺「因冻结保留」的键在执行时必须仍在账本残留集，
+            否则整批拒绝执行。
+          </p>
+          <table>
+            <thead><tr><th>护栏指标</th><th>值</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>frozen_hit_keys</td>
+                <td>{{ guardrail.frozen_hit_keys?.length ?? 0 }}</td>
+                <td class="muted">
+                  {{ batch.status === 'preview' ? '预览承诺保留的冻结键' : '本次实际保留的冻结键' }}
+                </td>
+              </tr>
+              <tr>
+                <td>retained_count</td>
+                <td>{{ guardrail.retained_count }}</td>
+                <td class="muted">因冻结保留条数，与「因冻结保留」明细同源</td>
+              </tr>
+              <tr>
+                <td>deleted_count</td>
+                <td>{{ guardrail.deleted_count }}</td>
+                <td class="muted">
+                  {{ batch.status === 'preview' ? '预览阶段不删除（恒 0）' : '实际删除条数，仅来自预览可删清单' }}
+                </td>
+              </tr>
+              <tr>
+                <td>preview_vs_execute_frozen_delta</td>
+                <td>
+                  <span v-if="guardrailDelta">
+                    +{{ guardrailDelta.added?.length ?? 0 }} / −{{ guardrailDelta.removed?.length ?? 0 }}
+                  </span>
+                  <span v-else class="muted">待执行后比对</span>
+                </td>
+                <td class="muted">执行冻结集相对预览只许新增（收缩删除），removed 必须为 0</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <table v-if="guardrail.frozen_hit_keys?.length">
+            <thead><tr><th>冻结键</th><th>账本ID</th><th>流</th><th>seq</th><th>实体键</th><th>命中冻结</th></tr></thead>
+            <tbody>
+              <tr v-for="k in guardrail.frozen_hit_keys" :key="k.key">
+                <td class="muted">{{ k.key }}</td>
+                <td>{{ k.ledger_id }}</td>
+                <td>{{ k.stream_id }}</td>
+                <td>{{ k.seq }}</td>
+                <td>{{ k.entity_key }}</td>
+                <td>{{ k.hold_id ? `#${k.hold_id}` : '（原冻结已解除，待重新预览）' }}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div v-if="guardrailDelta && (guardrailDelta.added?.length || guardrailDelta.removed?.length)">
+            <p v-if="guardrailDelta.removed?.length" class="tag danger">
+              预览冻结键在执行时缺失：{{ guardrailDelta.removed.map((k) => `${k.key}(${k.entity_key})`).join('、') }}
+            </p>
+            <p v-if="guardrailDelta.added?.length" class="tag warn">
+              执行时新增冻结命中（只收缩不扩张）：{{ guardrailDelta.added.map((k) => `${k.key}(${k.entity_key})`).join('、') }}
+            </p>
+          </div>
+          <p v-for="(r, idx) in guardrail.refusal_reasons || []" :key="idx" class="tag danger">{{ r }}</p>
+        </template>
 
         <h3>因冻结保留（{{ frozenItems.length }}）</h3>
         <table>
@@ -355,7 +433,7 @@ onMounted(load)
         <tbody>
           <tr v-for="b in batches" :key="b.id">
             <td>{{ b.id }}</td>
-            <td><span class="tag" :class="b.status === 'executed' ? 'ok' : 'warn'">{{ b.status }}</span></td>
+            <td><span class="tag" :class="b.status === 'executed' ? 'ok' : (b.status === 'rejected' ? 'danger' : 'warn')">{{ b.status }}</span></td>
             <td>{{ b.retention_days }}</td>
             <td>{{ b.scanned_count }}</td>
             <td>{{ b.deletable_count }}</td>
